@@ -153,16 +153,67 @@ static int RunSc(string arguments)
     return process.ExitCode;
 }
 
-// Logger simples que escreve em arquivo
-sealed class FileLoggerProvider(string filePath) : ILoggerProvider
+// Logger simples que escreve em arquivo, com rotacao por tamanho.
+sealed class FileLoggerProvider : ILoggerProvider
 {
+    private readonly string _filePath;
     private readonly object _lock = new();
 
-    public ILogger CreateLogger(string categoryName) => new FileLogger(filePath, categoryName, _lock);
+    // Rotacao: ao passar de MaxBytes, arquiva em service.log.1/.2 mantendo
+    // no maximo (MaxArchives + 1) arquivos. Padrao: 10 MB x 3 arquivos (~30 MB).
+    private const long MaxBytes = 10L * 1024 * 1024;
+    private const int MaxArchives = 2;
+    private long _size = -1;
+
+    public FileLoggerProvider(string filePath) => _filePath = filePath;
+
+    public ILogger CreateLogger(string categoryName) => new FileLogger(this, categoryName);
+
+    public void Write(string line)
+    {
+        lock (_lock)
+        {
+            try
+            {
+                if (_size < 0)
+                    _size = File.Exists(_filePath) ? new FileInfo(_filePath).Length : 0;
+
+                var bytes = System.Text.Encoding.UTF8.GetByteCount(line) + Environment.NewLine.Length;
+                if (_size > 0 && _size + bytes > MaxBytes)
+                {
+                    Rotate();
+                    _size = 0;
+                }
+
+                File.AppendAllText(_filePath, line + Environment.NewLine);
+                _size += bytes;
+            }
+            catch { }
+        }
+    }
+
+    private void Rotate()
+    {
+        try
+        {
+            var oldest = $"{_filePath}.{MaxArchives}";
+            if (File.Exists(oldest)) File.Delete(oldest);
+
+            for (int i = MaxArchives - 1; i >= 1; i--)
+            {
+                var src = $"{_filePath}.{i}";
+                if (File.Exists(src)) File.Move(src, $"{_filePath}.{i + 1}");
+            }
+
+            if (File.Exists(_filePath)) File.Move(_filePath, $"{_filePath}.1");
+        }
+        catch { }
+    }
+
     public void Dispose() { }
 }
 
-sealed class FileLogger(string filePath, string category, object lockObj) : ILogger
+sealed class FileLogger(FileLoggerProvider provider, string category) : ILogger
 {
     // Extrai so o nome da classe (sem namespace)
     private readonly string _category = category.Contains('.') ? category[(category.LastIndexOf('.') + 1)..] : category;
@@ -186,13 +237,6 @@ sealed class FileLogger(string filePath, string category, object lockObj) : ILog
         if (exception != null)
             line += $"\n  {exception.GetType().Name}: {exception.Message}";
 
-        lock (lockObj)
-        {
-            try
-            {
-                File.AppendAllText(filePath, line + Environment.NewLine);
-            }
-            catch { }
-        }
+        provider.Write(line);
     }
 }
