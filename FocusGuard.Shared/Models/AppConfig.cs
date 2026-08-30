@@ -35,9 +35,20 @@ public class AppConfig
 
 	public List<string> WhitelistedSites { get; set; } = new List<string>();
 
+	// Categoria "cota diaria": sites liberados por tempo limitado por dia.
+	// Ao atingir DailyLimitMinutes de minutos ativos no dia, o site e bloqueado
+	// ate a meia-noite (reseta sozinho). Contador e por site.
+	public List<string> LimitedSites { get; set; } = new List<string>();
+
+	public int DailyLimitMinutes { get; set; } = 10;
+
 	public bool UseAiAnalysis { get; set; } = false;
 
 	public string AiModel { get; set; } = "gpt-5.4-nano";
+
+	// Endpoint da API de analise (compativel com OpenAI /chat/completions).
+	// Padrao: airouter proprio. Pode ser trocado sem recompilar.
+	public string AiEndpoint { get; set; } = "https://airouter.escaladaonline.com.br/v1/chat/completions";
 
 	[JsonIgnore]
 	public string AiApiKey { get; set; } = string.Empty;

@@ -23,7 +23,7 @@ public static class AiContentAnalyzerService
 		Timeout = TimeSpan.FromSeconds(30L)
 	};
 
-	private const string OpenAiEndpoint = "https://api.openai.com/v1/chat/completions";
+	private const string DefaultEndpoint = "https://airouter.escaladaonline.com.br/v1/chat/completions";
 
 	private const string SystemPrompt = "You are a content safety classifier for a parental control / focus tool.\n" +
 		"You will receive a list of internet domains. For each domain, classify it into exactly one category:\n" +
@@ -41,8 +41,9 @@ public static class AiContentAnalyzerService
 		"Return a JSON array with this exact format:\n" +
 		"[{\"domain\": \"example.com\", \"category\": \"safe\"}, {\"domain\": \"pornhub.com\", \"category\": \"adult\"}, {\"domain\": \"croxyproxy.com\", \"category\": \"proxy\"}]";
 
-	public static async Task<List<AiClassification>> AnalyzeBatchAsync(List<string> domains, string apiKey, string model = "gpt-5.4-nano", Action<string>? log = null)
+	public static async Task<List<AiClassification>> AnalyzeBatchAsync(List<string> domains, string apiKey, string model = "gpt-5.4-nano", string? endpoint = null, Action<string>? log = null)
 	{
+		string url = string.IsNullOrWhiteSpace(endpoint) ? DefaultEndpoint : endpoint;
 		if (domains.Count == 0)
 		{
 			return new List<AiClassification>();
@@ -71,9 +72,9 @@ public static class AiContentAnalyzerService
 				max_completion_tokens = 2000
 			};
 			string json = JsonSerializer.Serialize(requestBody);
-			log?.Invoke("AI Request: POST " + OpenAiEndpoint);
+			log?.Invoke("AI Request: POST " + url);
 			log?.Invoke($"AI Request: modelo={model}, dominios=[{string.Join(", ", domains)}]");
-			HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, OpenAiEndpoint)
+			HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, url)
 			{
 				Content = new StringContent(json, Encoding.UTF8, "application/json")
 			};

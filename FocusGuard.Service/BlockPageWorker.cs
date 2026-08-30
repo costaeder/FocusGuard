@@ -9,6 +9,8 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.RegularExpressions;
+using FocusGuard.Shared.Models;
+using FocusGuard.Shared.Services;
 
 namespace FocusGuard.Service;
 
@@ -20,6 +22,7 @@ namespace FocusGuard.Service;
 public partial class BlockPageWorker : BackgroundService
 {
     private readonly ILogger<BlockPageWorker> _logger;
+    private readonly BlockedDomainStore _blockedStore;
     private X509Certificate2? _rootCaCert;
     private readonly ConcurrentDictionary<string, X509Certificate2> _domainCerts = new();
     private readonly SemaphoreSlim _connectionLimiter = new(20, 20);
@@ -32,9 +35,10 @@ public partial class BlockPageWorker : BackgroundService
     private static readonly string RootCaPath = Path.Combine(CertDir, "rootca.pfx");
     private const string RootCaPassword = "FocusGuardCA2024";
 
-    public BlockPageWorker(ILogger<BlockPageWorker> logger)
+    public BlockPageWorker(ILogger<BlockPageWorker> logger, BlockedDomainStore blockedStore)
     {
         _logger = logger;
+        _blockedStore = blockedStore;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -146,10 +150,10 @@ public partial class BlockPageWorker : BackgroundService
         }
     }
 
-    private static async Task ServeBlockPageAsync(Stream stream)
+    private async Task ServeBlockPageAsync(Stream stream)
     {
         // Lê os headers do HTTP request
-        var buffer = new byte[4096];
+        var buffer = new byte[8192];
         var bytesRead = await stream.ReadAsync(buffer);
 
         if (bytesRead == 0) return;
@@ -160,8 +164,16 @@ public partial class BlockPageWorker : BackgroundService
         var hostMatch = HostRegex().Match(request);
         var hostname = hostMatch.Success ? hostMatch.Groups[1].Value.Trim() : "site bloqueado";
 
+        // Detecta URLs/dominios embutidos como parametro (bypass via web proxy).
+        // So e visivel aqui porque o site ja esta bloqueado e caiu no nosso listener.
+        DetectEmbeddedTargets(hostname, request);
+
+        // Sites da categoria "cota diaria" so caem aqui quando o limite do dia
+        // ja foi atingido -> mostra mensagem especifica.
+        var isLimited = IsLimitedHost(hostname);
+
         // Monta e envia a resposta HTTP
-        var html = GetBlockPageHtml(hostname);
+        var html = GetBlockPageHtml(hostname, isLimited);
         var htmlBytes = Encoding.UTF8.GetBytes(html);
 
         var responseHeader =
@@ -357,11 +369,95 @@ public partial class BlockPageWorker : BackgroundService
 
     #endregion
 
+    /// <summary>
+    /// Analisa a request line (ex.: "GET /?url=https://xvideos.com HTTP/1.1") em busca
+    /// de dominios embutidos como parametro — tecnica classica de bypass via web proxy.
+    /// Registra a tentativa no log e no Event Log. Se o destino embutido tambem estiver
+    /// bloqueado, sinaliza com mais destaque. Nao interfere na resposta (best-effort).
+    /// </summary>
+    private void DetectEmbeddedTargets(string proxyHost, string request)
+    {
+        try
+        {
+            // Primeira linha do request = metodo + caminho/query + versao
+            var lineEnd = request.IndexOfAny(['\r', '\n']);
+            var requestLine = lineEnd > 0 ? request[..lineEnd] : request;
+
+            // Decodifica percent-encoding (url%3A%2F%2F... -> url://...) para achar os alvos
+            string decoded;
+            try { decoded = Uri.UnescapeDataString(requestLine); }
+            catch { decoded = requestLine; }
+
+            var targets = EmbeddedDomainRegex().Matches(decoded)
+                .Select(m => m.Groups[1].Value.Trim('.', '/').ToLowerInvariant())
+                .Where(d => d.Contains('.') && d.Length >= 4 &&
+                            !d.Equals(proxyHost, StringComparison.OrdinalIgnoreCase))
+                .Distinct()
+                .Take(5)
+                .ToList();
+
+            if (targets.Count == 0) return;
+
+            var blocked = targets.Where(_blockedStore.IsBlocked).ToList();
+            var alvos = string.Join(", ", targets);
+
+            if (blocked.Count > 0)
+            {
+                _logger.LogWarning(
+                    "[PROXY-PARAM] BYPASS via {ProxyHost} -> destino BLOQUEADO embutido: {Blocked} (todos: {Targets})",
+                    proxyHost, string.Join(", ", blocked), alvos);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "[PROXY-PARAM] Acesso via {ProxyHost} com destino embutido na URL: {Targets}",
+                    proxyHost, alvos);
+            }
+
+            try
+            {
+                using var eventLog = new System.Diagnostics.EventLog("Application") { Source = "FocusGuard" };
+                var detalhe = blocked.Count > 0
+                    ? $"Destino(s) BLOQUEADO(S) na URL: {string.Join(", ", blocked)}"
+                    : $"Destino(s) na URL: {alvos}";
+                eventLog.WriteEntry(
+                    $"Tentativa de bypass via web proxy detectada.\nProxy: {proxyHost}\n{detalhe}",
+                    System.Diagnostics.EventLogEntryType.Warning);
+            }
+            catch { /* Event Log indisponivel - ignora */ }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "BlockPage: erro ao detectar destino embutido");
+        }
+    }
+
+    /// <summary>Verifica se o host pertence a categoria "cota diaria" (config.LimitedSites).</summary>
+    private static bool IsLimitedHost(string hostname)
+    {
+        try
+        {
+            var host = hostname.Trim().ToLowerInvariant();
+            foreach (var site in AppConfig.Load().LimitedSites)
+            {
+                var s = site.Trim().ToLowerInvariant();
+                if (host.Equals(s) || host.EndsWith("." + s))
+                    return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
     #region HTML
 
-    private static string GetBlockPageHtml(string hostname)
+    private static string GetBlockPageHtml(string hostname, bool isLimited = false)
     {
         var safeHostname = WebEncode(hostname);
+        var titulo = isLimited ? "Limite diário atingido" : "Mantenha o Foco";
+        var mensagem = isLimited
+            ? "Você já usou todo o seu tempo diário neste site. O acesso será liberado novamente amanhã."
+            : "Este site foi bloqueado pelo FocusGuard para ajudar a manter sua produtividade e bem-estar.";
         return $$"""
             <!DOCTYPE html>
             <html lang="pt-BR">
@@ -448,8 +544,8 @@ public partial class BlockPageWorker : BackgroundService
                             <path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16l-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z"/>
                         </svg>
                     </div>
-                    <h1>Mantenha o Foco</h1>
-                    <p>Este site foi bloqueado pelo FocusGuard para ajudar a manter sua produtividade e bem-estar.</p>
+                    <h1>{{titulo}}</h1>
+                    <p>{{mensagem}}</p>
                     <div class="domain">{{safeHostname}}</div>
                     <div class="footer">FocusGuard</div>
                 </div>
@@ -471,4 +567,9 @@ public partial class BlockPageWorker : BackgroundService
 
     [GeneratedRegex(@"Host:\s*([^\r\n:]+)", RegexOptions.IgnoreCase)]
     private static partial Regex HostRegex();
+
+    // Captura um dominio que aparece depois de "://" (scheme) ou depois de um
+    // parametro de query ("?nome=" / "&nome="). Cobre url=, ref=, u=, q=, target= etc.
+    [GeneratedRegex(@"(?:https?://|[?&][a-z0-9_]{1,12}=)([a-z0-9-]+(?:\.[a-z0-9-]+)+)", RegexOptions.IgnoreCase)]
+    private static partial Regex EmbeddedDomainRegex();
 }

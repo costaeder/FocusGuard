@@ -19,6 +19,14 @@ public class DnsProxyWorker : BackgroundService
     private readonly ILogger<DnsProxyWorker> _logger;
     private readonly BlockedDomainStore _blockedStore;
     private readonly DnsQueryNotifier _queryNotifier;
+    private readonly UsageTracker _usageTracker;
+
+    // Categoria "cota diaria" (atualizada no ReloadConfigLoop).
+    private volatile HashSet<string> _limitedSites = new(StringComparer.OrdinalIgnoreCase);
+    private volatile int _dailyLimitMinutes = 10;
+    // TTL curto forcado nos sites limitados para o navegador re-consultar
+    // o DNS a cada minuto (melhora a contagem de minutos ativos).
+    private const int LimitedTtlSeconds = 60;
 
     private static readonly IPAddress ProxyAddress = IPAddress.Parse("127.0.0.2");
     private const int DnsPort = 53;
@@ -38,18 +46,50 @@ public class DnsProxyWorker : BackgroundService
     public DnsProxyWorker(
         ILogger<DnsProxyWorker> logger,
         BlockedDomainStore blockedStore,
-        DnsQueryNotifier queryNotifier)
+        DnsQueryNotifier queryNotifier,
+        UsageTracker usageTracker)
     {
         _logger = logger;
         _blockedStore = blockedStore;
         _queryNotifier = queryNotifier;
+        _usageTracker = usageTracker;
+    }
+
+    /// <summary>Recarrega a config da categoria "cota diaria".</summary>
+    private void ReloadLimitedConfig()
+    {
+        try
+        {
+            var cfg = AppConfig.Load();
+            _limitedSites = new HashSet<string>(
+                cfg.LimitedSites.Select(s => s.TrimEnd('.').ToLowerInvariant()),
+                StringComparer.OrdinalIgnoreCase);
+            _dailyLimitMinutes = cfg.DailyLimitMinutes > 0 ? cfg.DailyLimitMinutes : 10;
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// Se o dominio pertence a categoria limitada, retorna o site base
+    /// correspondente (chave do contador de uso); senao null.
+    /// </summary>
+    private string? MatchLimited(string domain)
+    {
+        foreach (var site in _limitedSites)
+        {
+            if (domain.Equals(site, StringComparison.OrdinalIgnoreCase) ||
+                domain.EndsWith("." + site, StringComparison.OrdinalIgnoreCase))
+                return site;
+        }
+        return null;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _blockedStore.Reload(ContentAnalyzerWorker.IsWhitelisted);
-        _logger.LogInformation("DNS Proxy iniciando em {Address}:{Port} ({Count} dominios bloqueados)",
-            ProxyAddress, DnsPort, _blockedStore.Count);
+        ReloadLimitedConfig();
+        _logger.LogInformation("DNS Proxy iniciando em {Address}:{Port} ({Count} dominios bloqueados, {Limited} com cota diaria de {Min}min)",
+            ProxyAddress, DnsPort, _blockedStore.Count, _limitedSites.Count, _dailyLimitMinutes);
 
         var config = AppConfig.Load();
         var upstream = config.GetSelectedDns();
@@ -197,6 +237,32 @@ public class DnsProxyWorker : BackgroundService
             var baseDomain = GetBaseDomain(domain);
             if (!string.IsNullOrEmpty(baseDomain))
                 _queryNotifier.Enqueue(baseDomain);
+
+            // === Categoria "cota diaria" (precedencia sobre bloqueio/whitelist) ===
+            var limited = MatchLimited(domain);
+            if (limited != null)
+            {
+                byte[] limitedResponse;
+                if (_usageTracker.IsOverLimit(limited, _dailyLimitMinutes))
+                {
+                    _logger.LogInformation("[LIMITE] BLOQUEADO {Domain}: cota de {Min}min/dia atingida ({Site})",
+                        domain, _dailyLimitMinutes, limited);
+                    limitedResponse = BuildBlockedResponse(data, queryType);
+                }
+                else
+                {
+                    bool newMinute = _usageTracker.RecordActivity(limited);
+                    limitedResponse = await ForwardToUpstreamAsync(data, ct);
+                    CapTtl(limitedResponse, LimitedTtlSeconds);
+                    if (newMinute)
+                        _logger.LogInformation("[LIMITE] {Site}: {Used}/{Min} min usados hoje",
+                            limited, _usageTracker.GetUsedMinutes(limited), _dailyLimitMinutes);
+                }
+
+                if (limitedResponse.Length > 0)
+                    await server.SendAsync(limitedResponse, remoteEp, ct);
+                return;
+            }
 
             byte[] response;
 
@@ -444,6 +510,50 @@ public class DnsProxyWorker : BackgroundService
         return minTtl;
     }
 
+    /// <summary>
+    /// Reescreve, in-place, o TTL de todos os answer records para no maximo
+    /// capSeconds. Usado nos sites com cota diaria para forcar o navegador a
+    /// re-consultar o DNS a cada ~minuto (melhora a contagem de minutos ativos).
+    /// </summary>
+    private static void CapTtl(byte[] response, int capSeconds)
+    {
+        if (response.Length < 12) return;
+        try
+        {
+            int answerCount = (response[6] << 8) | response[7];
+            int offset = SkipQuestion(response, 12);
+
+            for (int i = 0; i < answerCount && offset < response.Length; i++)
+            {
+                // Skip name
+                while (offset < response.Length)
+                {
+                    byte b = response[offset];
+                    if (b == 0) { offset++; break; }
+                    if ((b & 0xC0) == 0xC0) { offset += 2; break; }
+                    offset += b + 1;
+                }
+
+                if (offset + 10 > response.Length) break;
+
+                offset += 4; // Type (2) + Class (2)
+
+                int existing = (response[offset] << 24) | (response[offset + 1] << 16) |
+                               (response[offset + 2] << 8) | response[offset + 3];
+                int capped = (existing <= 0 || existing > capSeconds) ? capSeconds : existing;
+                response[offset] = (byte)(capped >> 24);
+                response[offset + 1] = (byte)(capped >> 16);
+                response[offset + 2] = (byte)(capped >> 8);
+                response[offset + 3] = (byte)capped;
+                offset += 4;
+
+                int rdLen = (response[offset] << 8) | response[offset + 1];
+                offset += 2 + rdLen;
+            }
+        }
+        catch { /* melhor esforco; se o parse falhar, deixa o TTL original */ }
+    }
+
     private static string GetBaseDomain(string domain)
     {
         var parts = domain.Split('.');
@@ -465,6 +575,7 @@ public class DnsProxyWorker : BackgroundService
                 await Task.Delay(TimeSpan.FromSeconds(15), ct);
                 var before = _blockedStore.Count;
                 _blockedStore.Reload(ContentAnalyzerWorker.IsWhitelisted);
+                ReloadLimitedConfig();
                 var after = _blockedStore.Count;
                 if (after != before)
                     _logger.LogInformation("[DNS] Dominios bloqueados atualizados: {Count}", after);

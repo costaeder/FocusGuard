@@ -46,6 +46,7 @@ builder.Logging.AddProvider(new FileLoggerProvider(logFile));
 // Singletons compartilhados entre workers
 builder.Services.AddSingleton<FocusGuard.Shared.Services.BlockedDomainStore>();
 builder.Services.AddSingleton<FocusGuard.Shared.Services.DnsQueryNotifier>();
+builder.Services.AddSingleton<FocusGuard.Shared.Services.UsageTracker>();
 
 // DNS Proxy deve iniciar primeiro (os outros dependem dele)
 builder.Services.AddHostedService<DnsProxyWorker>();

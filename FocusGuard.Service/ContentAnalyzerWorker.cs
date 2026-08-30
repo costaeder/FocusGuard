@@ -102,6 +102,15 @@ public partial class ContentAnalyzerWorker : BackgroundService
         ".arpa", ".test", ".invalid", ".localhost"
     ];
 
+    // Tokens que, no NOME do dominio (sem TLD), indicam fortemente um web proxy /
+    // anonymizer. Deteccao local e instantanea, sem depender da IA/OpenAI.
+    // Mantida conservadora para evitar falsos positivos em sites legitimos.
+    private static readonly string[] ProxyNameTokens =
+    [
+        "proxy", "unblock", "unblocker", "croxy", "webproxy",
+        "freeproxy", "proxysite", "anonymizer", "anonymouse"
+    ];
+
     public ContentAnalyzerWorker(
         ILogger<ContentAnalyzerWorker> logger,
         BlockedDomainStore blockedStore,
@@ -342,6 +351,20 @@ public partial class ContentAnalyzerWorker : BackgroundService
     {
         try
         {
+            // === ETAPA 0: Heuristica local de nome de proxy (instantanea, sem IA) ===
+            // Web proxies existem para burlar o filtro -> bloqueio imediato.
+            if (LooksLikeProxy(domain))
+            {
+                var proxySite = new AnalyzedSite
+                {
+                    Domain = domain,
+                    Category = "proxy",
+                    MatchedKeywords = ["proxy-name"]
+                };
+                await ProcessBadDetectionAsync(proxySite, config, ScoreAiProxy, "proxy-name");
+                return true;
+            }
+
             // === ETAPA 1: Verifica se o dominio é bloqueado pelos DNS family providers ===
             var (isBlockedByDns, blockedBy) = await DnsService.IsDomainBlockedByFamilyDnsAsync(
                 domain, msg => _logger.LogDebug(msg));
@@ -392,6 +415,7 @@ public partial class ContentAnalyzerWorker : BackgroundService
                 domains,
                 config.AiApiKey,
                 config.AiModel,
+                config.AiEndpoint,
                 msg => _logger.LogInformation(msg));
 
             _logger.LogInformation("[IA] Resposta: {Count} classificacoes recebidas", classifications.Count);
@@ -558,6 +582,25 @@ public partial class ContentAnalyzerWorker : BackgroundService
             }
         }
 
+        return false;
+    }
+
+    /// <summary>
+    /// Heuristica local: o nome do dominio (sem TLD) contem algum token
+    /// caracteristico de web proxy / anonymizer? Nao depende da IA.
+    /// Ex: "croxyproxy.com" -> true, "proxysite.net" -> true.
+    /// </summary>
+    private static bool LooksLikeProxy(string domain)
+    {
+        var name = GetDomainName(domain);
+        if (string.IsNullOrEmpty(name) || name.Length < 4)
+            return false; // nomes curtos geram falsos positivos
+
+        foreach (var token in ProxyNameTokens)
+        {
+            if (name.Contains(token, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
         return false;
     }
 
